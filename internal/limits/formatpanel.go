@@ -89,6 +89,9 @@ func windowTag(w *LimitWindow, fallback string) string {
 }
 
 func minutesTag(mins int) string {
+	if mins == 240 {
+		return "4h"
+	}
 	if mins <= 360 {
 		return "5h"
 	}
