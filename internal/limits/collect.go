@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/antigravity"
+	"github.com/senna-lang/herdr-agent-usage/internal/providers/cpam"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/kilo"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/nan"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/opencode"
@@ -54,6 +55,12 @@ type CollectOptions struct {
 	// Kilo has no per-account profile concept either (one Kilo Gateway login
 	// per store), so like Antigravity it is a single injectable collector.
 	Kilo LimitsCollector
+	// CPAM, like Nan, is not an agent: the proxy fronts OAuth accounts whose
+	// plan state only its management API can read. It yields one display row
+	// per enabled claude/codex account and is collected regardless of the
+	// Only filter, for the same reason Nan is. Nil leaves it uncollected in a
+	// bare CollectOptions{}, matching the other single collectors.
+	CPAM func(cwd *string, nowMs int64) []ProviderLimits
 	// Nan is not an agent: it never runs in a Herdr pane, so it owns no
 	// context resolution and no pane identity. Its quota lives on NaN Cloud's
 	// own endpoint, so unlike every agent collector it yields one display row
@@ -163,6 +170,9 @@ func DefaultCollectOptions() CollectOptions {
 		Nan: func(_ *string, nowMs int64) []ProviderLimits {
 			return nan.Limits(nowMs)
 		},
+		CPAM: func(_ *string, nowMs int64) []ProviderLimits {
+			return cpam.Limits(nowMs)
+		},
 	}
 }
 
@@ -252,12 +262,15 @@ func CollectAllProviderLimits(cwd *string, nowMs int64, opts CollectOptions) []P
 			base = append(base, collect(spec.field(opts), spec.id, spec.label))
 		}
 	}
-	// Nan is collected regardless of Only: it has no panes whose openness
-	// could gate it, so its own credential is the only activity signal there
-	// is, and an uncollected credential would blank a block the user asked
-	// to always see.
+	// Nan and CPAM are collected regardless of Only: they have no panes whose
+	// openness could gate them, so their own credentials are the only
+	// activity signal there is, and an uncollected credential would blank a
+	// block the user asked to always see.
 	if opts.Nan != nil {
 		base = append(base, opts.Nan(cwd, nowMs)...)
+	}
+	if opts.CPAM != nil {
+		base = append(base, opts.CPAM(cwd, nowMs)...)
 	}
 
 	if opts.Attach != nil {
