@@ -47,6 +47,7 @@ type Account struct {
 	Email     string
 	AuthIndex string
 	PlanType  string
+	ProjectID string // antigravity's cloudaicompanionProject, from auth-files
 }
 
 type authFiles struct {
@@ -55,6 +56,7 @@ type authFiles struct {
 		Email     string `json:"email"`
 		AuthIndex string `json:"auth_index"`
 		Disabled  bool   `json:"disabled"`
+		ProjectID string `json:"project_id"`
 	} `json:"files"`
 }
 
@@ -71,7 +73,7 @@ func ListAccounts(baseURL, key string, client *http.Client) ([]Account, error) {
 	var out []Account
 	for _, file := range parsed.Files {
 		provider := strings.ToLower(strings.TrimSpace(file.Provider))
-		if provider != "claude" && provider != "codex" {
+		if provider != "claude" && provider != "codex" && provider != "antigravity" {
 			continue
 		}
 		if file.Disabled || file.AuthIndex == "" {
@@ -81,6 +83,7 @@ func ListAccounts(baseURL, key string, client *http.Client) ([]Account, error) {
 			Provider:  provider,
 			Email:     strings.TrimSpace(file.Email),
 			AuthIndex: file.AuthIndex,
+			ProjectID: strings.TrimSpace(file.ProjectID),
 		})
 	}
 	return out, nil
@@ -93,6 +96,7 @@ type apiCallRequest struct {
 	Method    string            `json:"method"`
 	URL       string            `json:"url"`
 	Header    map[string]string `json:"header,omitempty"`
+	Body      string            `json:"body,omitempty"`
 }
 
 // apiCallResponse wraps the upstream exchange.
@@ -198,8 +202,10 @@ func (u AccountUsage) ProviderAccountLabel() string {
 
 const claudeBeta = "oauth-2025-04-20"
 
-// FetchUsage reads one account's upstream usage. Each provider's adapter
-// accepts the shapes the upstream has actually served.
+// FetchUsage reads one account's upstream usage. Only claude, codex and
+// antigravity accounts are read: those upstream adapters are verified against
+// real responses. Each adapter accepts the shapes the upstream has actually
+// served.
 func FetchUsage(baseURL, key string, account Account, client *http.Client) (AccountUsage, error) {
 	usage := AccountUsage{Account: account}
 	switch account.Provider {
@@ -235,6 +241,8 @@ func FetchUsage(baseURL, key string, account Account, client *http.Client) (Acco
 		}
 		usage.Primary, usage.Weekly, err = parseCodexUsage(body)
 		return usage, err
+	case "antigravity":
+		return fetchAntigravityUsage(baseURL, key, account, client)
 	default:
 		return usage, fmt.Errorf("cpam: no usage adapter for %s", account.Provider)
 	}

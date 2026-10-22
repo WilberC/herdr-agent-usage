@@ -28,7 +28,7 @@ const codexUsagePayload = `{"email":"wilber@example.com","plan_type":"plus",
 "primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1792690165},
 "secondary_window":{"used_percent":1,"limit_window_seconds":604800,"reset_at":1793125136}}}`
 
-func TestListAccounts_KeepsEnabledClaudeAndCodexOnly(t *testing.T) {
+func TestListAccounts_KeepsEnabledClaudeCodexAndAntigravity(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/management/auth-files" {
 			http.NotFound(w, r)
@@ -42,10 +42,10 @@ func TestListAccounts_KeepsEnabledClaudeAndCodexOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(accounts) != 2 {
-		t.Fatalf("the disabled codex and the antigravity account are not read: %+v", accounts)
+	if len(accounts) != 3 {
+		t.Fatalf("the disabled codex is not read, the rest keep: %+v", accounts)
 	}
-	if accounts[0].Provider != "claude" || accounts[1].Provider != "codex" {
+	if accounts[0].Provider != "claude" || accounts[1].Provider != "codex" || accounts[2].Provider != "antigravity" {
 		t.Fatalf("the accounts keep their provider: %+v", accounts)
 	}
 }
@@ -123,6 +123,7 @@ func TestParseCodexUsage_AcceptsTheDocumentedShapeToo(t *testing.T) {
 }
 
 func TestPoll_OneAccountFailingDropsOnlyItsRow(t *testing.T) {
+	summary := `{"groups":[{"displayName":"G","buckets":[{"window":"5h","remainingFraction":1,"resetTime":"2026-10-22T17:58:55Z"}]}]}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v0/management/auth-files":
@@ -130,11 +131,14 @@ func TestPoll_OneAccountFailingDropsOnlyItsRow(t *testing.T) {
 		case "/v0/management/api-call":
 			var request apiCallRequest
 			readBody(r, &request)
-			if request.AuthIndex == "codex-idx" {
+			switch request.AuthIndex {
+			case "codex-idx":
 				w.Write([]byte(`{"status_code":500,"body":"boom"}`))
-				return
+			case "agy-idx":
+				w.Write([]byte(`{"status_code":200,"body":` + quote(summary) + `}`))
+			default:
+				w.Write([]byte(`{"status_code":200,"body":` + quote(claudeUsagePayload) + `}`))
 			}
-			w.Write([]byte(`{"status_code":200,"body":` + quote(claudeUsagePayload) + `}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -145,8 +149,11 @@ func TestPoll_OneAccountFailingDropsOnlyItsRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	if len(usage) != 1 || usage[0].Account.Provider != "claude" {
-		t.Fatalf("a failing account drops its row, the healthy one stays: %+v", usage)
+	if len(usage) != 2 {
+		t.Fatalf("the failing codex drops its row, the healthy ones stay: %+v", usage)
+	}
+	if usage[0].Account.Provider != "claude" || usage[1].Account.Provider != "antigravity" {
+		t.Fatalf("the rows keep the auth-files order: %s then %s", usage[0].Account.Provider, usage[1].Account.Provider)
 	}
 }
 
@@ -236,3 +243,38 @@ func readBody(r *http.Request, into any) {
 
 func intPtr(v int) *int       { return &v }
 func int64Ptr(v int64) *int64 { return &v }
+
+func TestFetchUsage_AntigravityReadsBucketsAndCollapsesToTheBindingWindow(t *testing.T) {
+	summary := `{"groups":[
+	 {"displayName":"Gemini models","buckets":[{"window":"weekly","remainingFraction":0.5,"resetTime":"2026-10-29T12:00:00Z"}]},
+	 {"displayName":"Claude and GPT models","buckets":[
+		 {"window":"weekly","remainingFraction":0.9,"resetTime":"2026-10-29T12:58:55Z"},
+		 {"window":"5h","remainingFraction":1,"resetTime":"2026-10-22T17:58:55Z"}]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status_code":200,"body":` + quote(summary) + `}`))
+	}))
+	defer server.Close()
+
+	usage, err := FetchUsage(server.URL, "key", Account{Provider: "antigravity", Email: "w@x", AuthIndex: "idx", ProjectID: "proj"}, server.Client())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if usage.Primary == nil || usage.Primary.UsedPercent != 0 {
+		t.Fatalf("the untouched 5h bucket is the primary: %+v", usage.Primary)
+	}
+	// Two weekly buckets (50% and 10% used): the binding one is 50% used.
+	if usage.Weekly == nil || usage.Weekly.UsedPercent != 50 {
+		t.Fatalf("the lowest remaining weekly bucket wins: %+v", usage.Weekly)
+	}
+	want := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC).Unix()
+	if usage.Weekly.ResetAt == nil || *usage.Weekly.ResetAt != want {
+		t.Fatalf("the bucket's own reset rides: %+v", usage.Weekly.ResetAt)
+	}
+}
+
+func TestParseAntigravityUsage_EmptyGroupsShowNoWindows(t *testing.T) {
+	primary, weekly, err := parseAntigravityUsage([]byte(`{"groups":[]}`))
+	if err != nil || primary != nil || weekly != nil {
+		t.Fatalf("no buckets means no windows: %v %+v %+v", err, primary, weekly)
+	}
+}
