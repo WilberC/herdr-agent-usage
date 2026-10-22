@@ -267,6 +267,9 @@ func parseClaudeUsage(body []byte) (*Window, *Window, error) {
 	return primary, weekly, nil
 }
 
+// claudeWindow reads one window. The oauth/usage endpoint reports the
+// utilization already as a percentage (0..100), unlike the response headers
+// the statusline bridge reads, which carry a 0..1 fraction.
 func claudeWindow(raw *struct {
 	Utilization *float64 `json:"utilization"`
 	ResetsAt    *string  `json:"resets_at"`
@@ -274,7 +277,7 @@ func claudeWindow(raw *struct {
 	if raw == nil || raw.Utilization == nil {
 		return nil, nil
 	}
-	window := &Window{UsedPercent: *raw.Utilization * 100}
+	window := &Window{UsedPercent: *raw.Utilization}
 	if raw.ResetsAt != nil {
 		if when, err := time.Parse(time.RFC3339, *raw.ResetsAt); err == nil {
 			seconds := when.Unix()
