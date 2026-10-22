@@ -17,9 +17,10 @@ const authFilesPayload = `{"files":[
  {"provider":"codex","email":"off@example.com","auth_index":"off-idx","disabled":true}
 ]}`
 
-// live Claude oauth/usage body: utilization fractions (0..1) and ISO resets.
-const claudeUsagePayload = `{"five_hour":{"utilization":0.42,"resets_at":"2026-10-22T18:00:00Z"},
-"seven_day":{"utilization":0.06,"resets_at":"2026-10-28T16:59:50Z"}}`
+// live Claude oauth/usage body: utilization already as a percentage (0..100)
+// and ISO resets.
+const claudeUsagePayload = `{"five_hour":{"utilization":42.0,"resets_at":"2026-10-22T18:00:00Z"},
+"seven_day":{"utilization":6.0,"resets_at":"2026-10-28T16:59:50Z"}}`
 
 // live codex wham/usage body: singular rate_limit with *_window slots.
 const codexUsagePayload = `{"email":"wilber@example.com","plan_type":"plus",
@@ -72,7 +73,7 @@ func TestFetchUsage_ClaudeReadsUtilizationAndResets(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 	if usage.Primary == nil || usage.Primary.UsedPercent != 42 {
-		t.Fatalf("the 0..1 utilization becomes a percentage: %+v", usage.Primary)
+		t.Fatalf("the percentage passes through unmultiplied: %+v", usage.Primary)
 	}
 	if usage.Weekly == nil || usage.Weekly.UsedPercent != 6 {
 		t.Fatalf("the weekly window rides: %+v", usage.Weekly)
