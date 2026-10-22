@@ -11,10 +11,10 @@ import (
 )
 
 const authFilesPayload = `{"files":[
- {"provider":"claude","email":"wilber@example.com","auth_index":"claude-idx","disabled":false},
- {"provider":"codex","email":"wilber@example.com","auth_index":"codex-idx","disabled":false},
  {"provider":"antigravity","email":"other@example.com","auth_index":"agy-idx","disabled":false},
- {"provider":"codex","email":"off@example.com","auth_index":"off-idx","disabled":true}
+ {"provider":"codex","email":"off@example.com","auth_index":"off-idx","disabled":true},
+ {"provider":"claude","email":"wilber@example.com","auth_index":"claude-idx","disabled":false},
+ {"provider":"codex","email":"wilber@example.com","auth_index":"codex-idx","disabled":false}
 ]}`
 
 // live Claude oauth/usage body: utilization already as a percentage (0..100)
@@ -45,8 +45,8 @@ func TestListAccounts_KeepsEnabledClaudeCodexAndAntigravity(t *testing.T) {
 	if len(accounts) != 3 {
 		t.Fatalf("the disabled codex is not read, the rest keep: %+v", accounts)
 	}
-	if accounts[0].Provider != "claude" || accounts[1].Provider != "codex" || accounts[2].Provider != "antigravity" {
-		t.Fatalf("the accounts keep their provider: %+v", accounts)
+	if accounts[0].Provider != "antigravity" || accounts[2].Provider != "codex" {
+		t.Fatalf("listing keeps the proxy's own order: %+v", accounts)
 	}
 }
 
@@ -152,8 +152,8 @@ func TestPoll_OneAccountFailingDropsOnlyItsRow(t *testing.T) {
 	if len(usage) != 2 {
 		t.Fatalf("the failing codex drops its row, the healthy ones stay: %+v", usage)
 	}
-	if usage[0].Account.Provider != "claude" || usage[1].Account.Provider != "antigravity" {
-		t.Fatalf("the rows keep the auth-files order: %s then %s", usage[0].Account.Provider, usage[1].Account.Provider)
+	if usage[0].Account.Provider != "antigravity" || usage[1].Account.Provider != "claude" {
+		t.Fatalf("the raw poll keeps the listing order; the panel priority is displayRows' job: %s then %s", usage[0].Account.Provider, usage[1].Account.Provider)
 	}
 }
 
@@ -227,6 +227,22 @@ func TestDisplayRows_GroupAndPlanCarry(t *testing.T) {
 	}
 	if row.Secondary == nil || *row.Secondary.WindowMinutes != 10080 {
 		t.Fatalf("the weekly window carries minutes: %+v", row.Secondary)
+	}
+}
+
+func TestDisplayRows_OrdersClaudeThenCodexThenTheRest(t *testing.T) {
+	usage := []AccountUsage{
+		{Account: Account{Provider: "antigravity", Email: "a@x"}},
+		{Account: Account{Provider: "codex", Email: "c@x"}},
+		{Account: Account{Provider: "claude", Email: "l@x"}},
+		{Account: Account{Provider: "antigravity", Email: "b@x"}},
+	}
+	rows := displayRows(usage, 0)
+	want := []string{"claude", "codex", "antigravity", "antigravity"}
+	for i, row := range rows {
+		if row.Label != want[i] {
+			t.Fatalf("row %d is %s, want %s", i, row.Label, want[i])
+		}
 	}
 }
 

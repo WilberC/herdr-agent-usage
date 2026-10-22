@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 
@@ -131,7 +132,9 @@ func Poll(baseURL, key string, nowMs int64, client *http.Client) ([]AccountUsage
 }
 
 // displayRows converts one poll into panel rows: the account's provider and
-// email name each row inside the shared "CPAM" group.
+// email name each row inside the shared "CPAM" group, ordered claude first,
+// then codex, then the rest — the auth-files listing order is the proxy's
+// file order, not a reading order.
 func displayRows(usage []AccountUsage, fetchedAtMs int64) []limitscore.ProviderLimits {
 	rows := make([]limitscore.ProviderLimits, 0, len(usage))
 	for _, account := range usage {
@@ -153,7 +156,24 @@ func displayRows(usage []AccountUsage, fetchedAtMs int64) []limitscore.ProviderL
 		}
 		rows = append(rows, row)
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return providerOrder(rows[i].Label) < providerOrder(rows[j].Label)
+	})
 	return rows
+}
+
+// providerOrder ranks the adapters the panel reads first; anything else
+// sorts last.
+func providerOrder(provider string) int {
+	switch provider {
+	case "claude":
+		return 0
+	case "codex":
+		return 1
+	case "antigravity":
+		return 2
+	}
+	return 3
 }
 
 // toLimitWindow carries the upstream's own window length so the formatter's
