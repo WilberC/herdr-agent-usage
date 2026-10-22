@@ -3,18 +3,22 @@ package nan
 import (
 	"errors"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
 // stubFetch installs a fetch stub and returns its restore, its recorded key,
-// and a call counter pointer.
+// and a call counter pointer. The disk cache is rerouted to a scratch file so
+// no test reads the real one and no test writes the real one.
 func stubFetch(t *testing.T, quota Quota, err error) (restore func(), key *string, calls *int) {
 	t.Helper()
 	Reset()
 	count := 0
 	seen := ""
-	origFetch, origGetenv := fetcher, getenv
+	origFetch, origGetenv, origCachePath := fetcher, getenv, cachePath
+	cacheFile := filepath.Join(t.TempDir(), "nan-quota-cache.json")
+	cachePath = func() string { return cacheFile }
 	fetcher = func(apiKey string, nowMs int64, _ *http.Client) (Quota, error) {
 		count++
 		seen = apiKey
@@ -26,7 +30,7 @@ func stubFetch(t *testing.T, quota Quota, err error) (restore func(), key *strin
 		}
 		return ""
 	}
-	return func() { fetcher, getenv = origFetch, origGetenv }, &seen, &count
+	return func() { fetcher, getenv, cachePath = origFetch, origGetenv, origCachePath }, &seen, &count
 }
 
 func TestLimits_OneRowPerMeteredModelGroupedUnderNan(t *testing.T) {
@@ -143,5 +147,65 @@ func TestDisplayRows_PeriodWindowSpansTheBillingPeriod(t *testing.T) {
 	}
 	if deepseek.Primary.ResetsAt == nil || *deepseek.Primary.ResetsAt != time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC).Unix() {
 		t.Fatalf("the reset is the period end: %+v", deepseek.Primary.ResetsAt)
+	}
+}
+
+func TestLimits_AFreshDiskCachePaintsWithoutTheNetwork(t *testing.T) {
+	quota, err := ParseQuota([]byte(liveShapePayload), 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	restore, _, calls := stubFetch(t, quota, nil)
+	defer restore()
+
+	writeCache(diskCache{FetchedAtMs: 1000, Quota: quota})
+	if rows := Limits(1000 + MinFetchIntervalMs - 1); len(rows) != 3 {
+		t.Fatalf("the disk cache paints the block: %d rows", len(rows))
+	}
+	if *calls != 0 {
+		t.Fatalf("a fresh disk cache skips the fetch: %d", *calls)
+	}
+}
+
+func TestLimits_AnExpiredDiskCacheStillShowsWhenTheFetchFails(t *testing.T) {
+	quota, err := ParseQuota([]byte(liveShapePayload), 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	restore, _, calls := stubFetch(t, quota, errors.New("HTTP 503"))
+	defer restore()
+
+	writeCache(diskCache{FetchedAtMs: 1000, Quota: quota})
+	rows := Limits(1000 + MinFetchIntervalMs)
+	if *calls != 1 {
+		t.Fatalf("an expired cache fetches: %d", *calls)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("the failed fetch keeps the last known state visible: %d rows", len(rows))
+	}
+}
+
+func TestLimits_AFetchPersistsTheSnapshot(t *testing.T) {
+	quota, err := ParseQuota([]byte(liveShapePayload), 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	restore, _, calls := stubFetch(t, quota, nil)
+	defer restore()
+
+	Limits(1000)
+	if *calls != 1 {
+		t.Fatalf("a cold start fetches: %d", *calls)
+	}
+	cached, ok := readCache()
+	if !ok || cached.FetchedAtMs != 1000 || len(cached.Quota.Models) != 3 {
+		t.Fatalf("the fetch persists the snapshot with its fetch time: %+v", cached)
+	}
+	Reset()
+	if rows := Limits(1000 + MinFetchIntervalMs - 1); len(rows) != 3 {
+		t.Fatalf("the persisted snapshot paints the next process warm: %d rows", len(rows))
+	}
+	if *calls != 1 {
+		t.Fatalf("the warm start does not fetch: %d", *calls)
 	}
 }

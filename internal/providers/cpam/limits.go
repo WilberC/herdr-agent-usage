@@ -10,10 +10,12 @@
 package cpam
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +26,74 @@ import (
 // MinPollIntervalMs is the smallest gap between two management polls. The
 // upstream usage endpoints are real plan reads, so this stays conservative.
 const MinPollIntervalMs = 5 * 60 * 1000
+
+// cacheFileName holds the last valid poll under the plugin config dir, so a
+// freshly opened panel paints the previous poll's numbers instead of waiting
+// on the gateway, and a gateway outage keeps the last known state visible.
+const cacheFileName = "cpam-quota-cache.json"
+
+// cachePath resolves the cache file; nil disables the disk cache (tests).
+var cachePath = func() string {
+	if dir := getenv("HERDR_PLUGIN_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, cacheFileName)
+	}
+	if xdg := getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "herdr", "plugins", "config", "usagebar", cacheFileName)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "herdr", "plugins", "config", "usagebar", cacheFileName)
+}
+
+type diskCache struct {
+	FetchedAtMs int64          `json:"fetchedAtMs"`
+	Usage       []AccountUsage `json:"usage"`
+}
+
+// readCache loads the persisted snapshot, if any.
+func readCache() (diskCache, bool) {
+	path := cachePath()
+	if path == "" {
+		return diskCache{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return diskCache{}, false
+	}
+	var cached diskCache
+	if json.Unmarshal(raw, &cached) != nil || cached.FetchedAtMs <= 0 || len(cached.Usage) == 0 {
+		return diskCache{}, false
+	}
+	return cached, true
+}
+
+// writeCache persists one snapshot; a failed write leaves the panel on the
+// network path, so it is never worth reporting.
+func writeCache(cached diskCache) {
+	path := cachePath()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	raw, err := json.Marshal(cached)
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".cpam-cache-*")
+	if err != nil {
+		return
+	}
+	if _, err := tmp.Write(raw); err == nil {
+		_ = tmp.Close()
+		_ = os.Rename(tmp.Name(), path)
+	} else {
+		_ = tmp.Close()
+	}
+}
 
 // commandRunner runs the credential command; tests stub it.
 var commandRunner = func(command string) ([]byte, error) {
@@ -100,10 +170,14 @@ func Limits(nowMs int64) []limitscore.ProviderLimits {
 
 	current.mu.Lock()
 	defer current.mu.Unlock()
-	if current.usage == nil || nowMs-current.fetchedAt >= MinPollIntervalMs {
-		if usage, pollErr := fetchAll(baseURL, key, nowMs, nil); pollErr == nil {
-			current.usage = usage
-			current.fetchedAt = nowMs
+	if len(current.usage) == 0 || nowMs-current.fetchedAt >= MinPollIntervalMs {
+		if cached, ok := readCache(); ok && nowMs-cached.FetchedAtMs < MinPollIntervalMs {
+			current.usage, current.fetchedAt = cached.Usage, cached.FetchedAtMs
+		} else if usage, pollErr := fetchAll(baseURL, key, nowMs, nil); pollErr == nil {
+			current.usage, current.fetchedAt = usage, nowMs
+			writeCache(diskCache{FetchedAtMs: nowMs, Usage: usage})
+		} else if cached, ok := readCache(); ok {
+			current.usage, current.fetchedAt = cached.Usage, cached.FetchedAtMs
 		}
 	}
 	if len(current.usage) == 0 {

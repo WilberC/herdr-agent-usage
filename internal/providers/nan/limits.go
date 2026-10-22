@@ -9,7 +9,9 @@
 package nan
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -24,6 +26,76 @@ var getenv = os.Getenv
 // ticker, so this stays conservative.
 const MinFetchIntervalMs = 5 * 60 * 1000
 
+// cacheFileName holds the last valid snapshot under the plugin config dir, so
+// a freshly opened panel paints the previous poll's numbers instead of
+// waiting on the network, and a gateway outage keeps the last known state
+// visible. The file carries the fetch time, so the throttle window survives
+// process exits.
+const cacheFileName = "nan-quota-cache.json"
+
+// cachePath resolves the cache file; nil disables the disk cache (tests).
+var cachePath = func() string {
+	if dir := getenv("HERDR_PLUGIN_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, cacheFileName)
+	}
+	if xdg := getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "herdr", "plugins", "config", "usagebar", cacheFileName)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "herdr", "plugins", "config", "usagebar", cacheFileName)
+}
+
+type diskCache struct {
+	FetchedAtMs int64 `json:"fetchedAtMs"`
+	Quota       Quota `json:"quota"`
+}
+
+// readCache loads the persisted snapshot, if any.
+func readCache() (diskCache, bool) {
+	path := cachePath()
+	if path == "" {
+		return diskCache{}, false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return diskCache{}, false
+	}
+	var cached diskCache
+	if json.Unmarshal(raw, &cached) != nil || cached.FetchedAtMs <= 0 {
+		return diskCache{}, false
+	}
+	return cached, true
+}
+
+// writeCache persists one snapshot; a failed write leaves the panel on the
+// network path, so it is never worth reporting.
+func writeCache(cached diskCache) {
+	path := cachePath()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	raw, err := json.Marshal(cached)
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".nan-cache-*")
+	if err != nil {
+		return
+	}
+	if _, err := tmp.Write(raw); err == nil {
+		_ = tmp.Close()
+		_ = os.Rename(tmp.Name(), path)
+	} else {
+		_ = tmp.Close()
+	}
+}
+
 // snapshot is the latest successfully parsed quota, guarded for the panel's
 // concurrent refresh paths.
 type snapshot struct {
@@ -34,7 +106,8 @@ type snapshot struct {
 
 var current snapshot
 
-// Reset drops the cached snapshot. Tests call this; production never does.
+// Reset drops the in-memory snapshot. Tests call this; production never
+// does, and the disk cache survives it on purpose.
 func Reset() {
 	current.mu.Lock()
 	defer current.mu.Unlock()
@@ -46,8 +119,10 @@ func Reset() {
 var fetcher = Fetch
 
 // Limits returns one display row per metered model, or nil when no
-// credential is configured. A fresh-enough cached snapshot is returned as
-// is; a fetch failure keeps the previous snapshot.
+// credential is configured. The fresh-enough snapshot comes from memory
+// first, then from the disk cache — a freshly opened panel paints without
+// the network — and only an expired window triggers a fetch; a failed fetch
+// keeps the last valid snapshot, falling back to a stale disk cache.
 func Limits(nowMs int64) []limitscore.ProviderLimits {
 	key, err := ResolveAPIKey(getenv)
 	if err != nil {
@@ -57,9 +132,13 @@ func Limits(nowMs int64) []limitscore.ProviderLimits {
 	current.mu.Lock()
 	defer current.mu.Unlock()
 	if current.quota == nil || nowMs-current.fetchedAt >= MinFetchIntervalMs {
-		if quota, fetchErr := fetcher(key, nowMs, nil); fetchErr == nil {
-			current.quota = &quota
-			current.fetchedAt = nowMs
+		if cached, ok := readCache(); ok && nowMs-cached.FetchedAtMs < MinFetchIntervalMs {
+			current.quota, current.fetchedAt = &cached.Quota, cached.FetchedAtMs
+		} else if quota, fetchErr := fetcher(key, nowMs, nil); fetchErr == nil {
+			current.quota, current.fetchedAt = &quota, nowMs
+			writeCache(diskCache{FetchedAtMs: nowMs, Quota: quota})
+		} else if cached, ok := readCache(); ok {
+			current.quota, current.fetchedAt = &cached.Quota, cached.FetchedAtMs
 		}
 	}
 	if current.quota == nil {

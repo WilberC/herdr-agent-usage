@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -192,11 +193,78 @@ func TestLimits_CredentialCommandsAndBaseURLResolve(t *testing.T) {
 	}
 }
 
+// stubAll routes the disk cache to a scratch file and installs an offline
+// fetch stub recording the base URL and key it was called with.
+func stubAll(t *testing.T, usage []AccountUsage, err error) (restore func(), calls *int, seenBase, seenKey *string) {
+	t.Helper()
+	Reset()
+	count := 0
+	base, key := "", ""
+	origFetchAll, origGetenv, origCachePath := fetchAll, getenv, cachePath
+	cacheFile := filepath.Join(t.TempDir(), "cpam-quota-cache.json")
+	cachePath = func() string { return cacheFile }
+	fetchAll = func(baseURL, runKey string, _ int64, _ *http.Client) ([]AccountUsage, error) {
+		count++
+		base, key = baseURL, runKey
+		return usage, err
+	}
+	getenv = func(name string) string {
+		switch name {
+		case "CPAM_BASE_URL":
+			return "https://cpam.example"
+		case "CPAM_MANAGEMENT_KEY":
+			return "test-key"
+		}
+		return ""
+	}
+	return func() { fetchAll, getenv, cachePath = origFetchAll, origGetenv, origCachePath }, &count, &base, &key
+}
+
+func TestLimits_AFreshDiskCachePaintsWithoutTheGateway(t *testing.T) {
+	restore, calls, _, _ := stubAll(t, nil, nil)
+	defer restore()
+	writeCache(diskCache{FetchedAtMs: 1000, Usage: []AccountUsage{{Account: Account{Provider: "claude", Email: "w@x"}}}})
+	rows := Limits(1000 + MinPollIntervalMs - 1)
+	if len(rows) != 1 || *calls != 0 {
+		t.Fatalf("a fresh disk cache paints without the gateway: %d rows, %d polls", len(rows), *calls)
+	}
+}
+
+func TestLimits_AnExpiredDiskCacheStillShowsWhenThePollFails(t *testing.T) {
+	restore, calls, _, _ := stubAll(t, nil, errors.New("offline"))
+	defer restore()
+	writeCache(diskCache{FetchedAtMs: 1000, Usage: []AccountUsage{{Account: Account{Provider: "claude", Email: "w@x"}}}})
+	rows := Limits(1000 + MinPollIntervalMs)
+	if len(rows) != 1 || *calls != 1 {
+		t.Fatalf("the failed poll keeps the last known state visible: %d rows, %d polls", len(rows), *calls)
+	}
+}
+
+func TestLimits_ASuccessfulPollPersistsTheSnapshot(t *testing.T) {
+	usage := []AccountUsage{{Account: Account{Provider: "codex", Email: "w@x", PlanType: "plus"}, Primary: &Window{UsedPercent: 3}}}
+	restore, calls, seenBase, seenKey := stubAll(t, usage, nil)
+	defer restore()
+
+	Limits(1000)
+	if *calls != 1 || *seenBase != "https://cpam.example" || *seenKey != "test-key" {
+		t.Fatalf("the poll carries the base URL and the key: %q %q %d", *seenBase, *seenKey, *calls)
+	}
+	cached, ok := readCache()
+	if !ok || cached.FetchedAtMs != 1000 || len(cached.Usage) != 1 {
+		t.Fatalf("the poll persists the snapshot: %+v", cached)
+	}
+	Reset()
+	if rows := Limits(1000 + MinPollIntervalMs - 1); len(rows) != 1 || *calls != 1 {
+		t.Fatalf("the next process starts warm: %d rows, %d polls", len(rows), *calls)
+	}
+}
+
 func TestLimits_NoCredentialMeansNoBlock(t *testing.T) {
 	Reset()
-	origGetenv := getenv
+	origGetenv, origCachePath := getenv, cachePath
+	cachePath = func() string { return filepath.Join(t.TempDir(), "c.json") }
 	getenv = func(string) string { return "" }
-	defer func() { getenv = origGetenv }()
+	defer func() { getenv, cachePath = origGetenv, origCachePath }()
 
 	if rows := Limits(0); rows != nil {
 		t.Fatalf("a machine without CPAM credentials shows no cpam block: %+v", rows)
